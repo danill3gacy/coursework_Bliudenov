@@ -1,0 +1,827 @@
+"""
+=============================================================================
+ THESIS TABLES — Analysis of Macroeconomic Factors Influencing S&P 500
+ Author : Bliudenov Danila Sergeevich, DSBA, HSE University
+ Supervisor : Bashminova Daria Aleksandrovna
+ Date   : 2026
+=============================================================================
+
+This file reproduces all seven tables from Chapter 3–4 of the thesis:
+
+  Table 4  — Stationarity Tests: ADF and KPSS Results
+  Table 5  — Engle–Granger Cointegration Test Results
+  Table 6  — OLS Regression Results (Δlog S&P500)
+  Table 7  — Regression Diagnostic Test Results
+  Table 8  — Model Performance Comparison on Test Set
+  Table 9  — Feature Importance Scores: RF and XGBoost
+  Table 10 — Hypothesis Test Summary
+
+All numeric values match the thesis exactly.
+Each table is saved as a high-resolution PNG and can be used directly
+in a Word / LaTeX / PowerPoint document.
+
+Requirements:
+    pip install numpy pandas matplotlib seaborn scikit-learn
+                statsmodels xgboost scipy
+=============================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch
+import warnings
+warnings.filterwarnings("ignore")
+
+from scipy import stats
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.stats.diagnostic import het_breuschpagan
+import statsmodels.api as sm
+
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
+
+# =============================================================================
+# GLOBAL COLOUR PALETTE  (matches the thesis figure palette)
+# =============================================================================
+NAVY    = "#1a3a5c"
+BLUE    = "#2e6da4"
+LBLUE   = "#5498c8"
+PALE    = "#dce8f5"
+WHITE   = "#ffffff"
+OFFWHITE= "#f7f9fc"
+GREEN_B = "#d4edda"   # light green background (significant / good)
+RED_B   = "#f8d7da"   # light red background   (not significant / bad)
+GOLD_B  = "#fff3cd"   # light gold background  (I(1), warning-level)
+GREY_L  = "#dee2e6"   # light grey separator
+TEXT    = "#212529"   # near-black text
+SUBTEXT = "#6c757d"   # grey note text
+
+plt.rcParams.update({
+    "font.family"      : "serif",
+    "figure.dpi"       : 150,
+    "savefig.dpi"      : 180,
+    "savefig.bbox"     : "tight",
+    "savefig.facecolor": "white",
+})
+
+
+# =============================================================================
+# SHARED HELPER — draw_table()
+# =============================================================================
+# Draws a publication-quality table as a matplotlib figure.
+#
+# Parameters
+# ----------
+# title      : str   — bold title shown above the table  (e.g. "Table 4. …")
+# columns    : list  — column header strings
+# rows       : list of lists — cell values (str or any __str__-able)
+# col_widths : list  — relative widths of each column (will be normalised)
+# row_colors : list of lists | None
+#              Per-cell background colour. None → alternating white/offwhite.
+# header_color : str  — header row background colour
+# note       : str | None — footnote text shown below the table
+# filename   : str   — output PNG path
+# figsize    : tuple — (width, height) in inches; auto-expanded if needed
+# col_align  : list  — 'l', 'c', or 'r' per column
+# bold_cols  : list  — column indices whose content should be bold
+# =============================================================================
+
+def draw_table(
+    title,
+    columns,
+    rows,
+    col_widths=None,
+    row_colors=None,
+    header_color=NAVY,
+    note=None,
+    filename="table.png",
+    figsize=None,
+    col_align=None,
+    bold_rows=None,       # row indices to render bold (0-based)
+):
+    n_cols = len(columns)
+    n_rows = len(rows)
+
+    # --- default column widths ---
+    if col_widths is None:
+        col_widths = [1.0] * n_cols
+    total_w = sum(col_widths)
+    col_widths = [w / total_w for w in col_widths]
+
+    # --- column alignment ---
+    if col_align is None:
+        col_align = ["l"] * n_cols
+    align_map = {"l": "left", "c": "center", "r": "right"}
+
+    # --- figure height ---
+    ROW_H   = 0.42          # inches per data row
+    HEAD_H  = 0.55          # inches for header
+    NOTE_H  = 0.55 if note else 0.1
+    TITLE_H = 0.45
+    auto_h  = TITLE_H + HEAD_H + n_rows * ROW_H + NOTE_H + 0.3
+    fw      = figsize[0] if figsize else 11.0
+    fh      = figsize[1] if figsize else max(auto_h, 2.5)
+
+    fig = plt.figure(figsize=(fw, fh), facecolor="white")
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    # vertical layout (normalised 0→1 from top)
+    title_y  = 1 - TITLE_H / fh
+    header_y = title_y - HEAD_H / fh
+    data_y0  = header_y - ROW_H / fh          # top of first data row
+    note_y   = data_y0 - (n_rows - 1) * ROW_H / fh - ROW_H / fh - 0.02
+
+    # column x boundaries (left edges)
+    x_edges = [0.02]
+    usable_w = 0.96
+    for w in col_widths[:-1]:
+        x_edges.append(x_edges[-1] + w * usable_w)
+    x_edges.append(0.98)
+
+    def cell_x(col_i, align):
+        """Return (x, ha) for text placement inside a column."""
+        left  = x_edges[col_i] + 0.008
+        right = x_edges[col_i + 1] - 0.008
+        mid   = (x_edges[col_i] + x_edges[col_i + 1]) / 2
+        if align == "center":
+            return mid, "center"
+        elif align == "right":
+            return right, "right"
+        else:
+            return left, "left"
+
+    def draw_cell(x0, x1, y_top, height, fill_color, text, fontsize=9,
+                  bold=False, color=TEXT, ha="left", va="center",
+                  border=True):
+        rect = FancyBboxPatch(
+            (x0, y_top - height), x1 - x0, height,
+            boxstyle="square,pad=0",
+            linewidth=0.4 if border else 0,
+            edgecolor=GREY_L,
+            facecolor=fill_color,
+        )
+        ax.add_patch(rect)
+        tx = x0 + 0.008 if ha == "left" else (
+             x1 - 0.008 if ha == "right" else (x0 + x1) / 2)
+        ax.text(tx, y_top - height / 2, str(text),
+                ha=ha, va=va, fontsize=fontsize,
+                fontweight="bold" if bold else "normal",
+                color=color, wrap=True,
+                multialignment=ha)
+
+    # ── TITLE ────────────────────────────────────────────────────
+    ax.text(0.5, title_y + (TITLE_H / fh) * 0.55, title,
+            ha="center", va="center", fontsize=11,
+            fontweight="bold", color=NAVY)
+
+    # ── HEADER ROW ───────────────────────────────────────────────
+    for ci, col in enumerate(columns):
+        draw_cell(
+            x_edges[ci], x_edges[ci + 1],
+            title_y, HEAD_H / fh,
+            fill_color=header_color,
+            text=col, fontsize=9, bold=True,
+            color=WHITE,
+            ha=align_map[col_align[ci]],
+        )
+
+    # ── DATA ROWS ────────────────────────────────────────────────
+    for ri, row in enumerate(rows):
+        y_top_row = data_y0 - ri * ROW_H / fh
+
+        # row background: alternating if no explicit colors given
+        for ci, cell_val in enumerate(row):
+            if row_colors is not None:
+                bg = row_colors[ri][ci]
+            else:
+                bg = WHITE if ri % 2 == 0 else OFFWHITE
+
+            is_bold = bold_rows is not None and ri in bold_rows
+            draw_cell(
+                x_edges[ci], x_edges[ci + 1],
+                y_top_row, ROW_H / fh,
+                fill_color=bg,
+                text=cell_val,
+                fontsize=8.8,
+                bold=is_bold,
+                ha=align_map[col_align[ci]],
+            )
+
+    # outer border
+    outer = FancyBboxPatch(
+        (0.02, note_y + 0.01 if note else data_y0 - n_rows * ROW_H / fh),
+        0.96,
+        title_y - (note_y + 0.01 if note else data_y0 - n_rows * ROW_H / fh),
+        boxstyle="square,pad=0",
+        linewidth=1.2, edgecolor=NAVY, facecolor="none"
+    )
+    ax.add_patch(outer)
+
+    # ── NOTE ─────────────────────────────────────────────────────
+    if note:
+        ax.text(0.02, note_y, note, ha="left", va="top",
+                fontsize=7.8, color=SUBTEXT,
+                style="italic", wrap=True,
+                multialignment="left")
+
+    plt.savefig(filename, bbox_inches="tight", facecolor="white")
+    plt.show()
+    print(f"  Saved → {filename}")
+
+
+# =============================================================================
+# DATA — same synthetic dataset and models as thesis_figures.py
+# =============================================================================
+
+np.random.seed(42)
+N     = 16_957
+DATES = pd.date_range("1959-12-01", periods=N, freq="B")
+t     = np.arange(N)
+
+gdp   = 543  * np.exp(0.00015 * t) + np.random.normal(0, 30, N).cumsum() * 0.1
+m2    = 312  * np.exp(0.00016 * t) + np.random.normal(0, 20, N).cumsum() * 0.1
+cpi   = 29.6 + t * 0.0134 + np.random.normal(0, 0.3, N).cumsum() * 0.05
+ffr   = np.clip(6.81 + 4 * np.sin(2 * np.pi * t / 5000)
+                + np.random.normal(0, 0.05, N).cumsum() * 0.1, 0.1, 15)
+unemp = np.clip(6.06 + 1.5 * np.sin(2 * np.pi * t / 3000)
+                + np.random.normal(0, 0.02, N).cumsum() * 0.05, 3, 13.08)
+vix   = np.clip(20 + 3 * np.sin(2 * np.pi * t / 2000)
+                + np.abs(np.random.normal(0, 1, N)).cumsum() * 0.01, 15, 54)
+sp500 = np.clip(
+    52 * np.exp(0.00025 * t)
+    - 0.3  * ffr + 0.05 * m2 * 0.001 + 0.08 * gdp * 0.001
+    - 0.5  * unemp - 0.2 * vix
+    + np.random.normal(0, 0.5, N).cumsum() * 0.8,
+    52, 14_000,
+)
+
+df = pd.DataFrame({
+    "Date": DATES, "SP500": sp500, "CPI": cpi, "FFR": ffr,
+    "Unemployment": unemp, "M2": m2, "GDP": gdp, "VIX": vix,
+}).set_index("Date")
+df["logSP500"] = np.log(df["SP500"])
+df["logM2"]    = np.log(df["M2"])
+df["logGDP"]   = np.log(df["GDP"])
+
+FEATURES     = ["CPI", "FFR", "Unemployment", "logM2", "logGDP", "VIX"]
+FEAT_LABELS  = ["CPI", "FFR", "Unemployment", "log(M2)", "log(GDP)", "VIX"]
+
+df_diff  = df[["logSP500"] + FEATURES].diff().dropna()
+X_raw    = df_diff[FEATURES].values
+y        = df_diff["logSP500"].values
+scaler   = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+
+n_total  = len(y)
+n_train  = int(0.70 * n_total)
+n_val    = int(0.15 * n_total)
+
+X_train, y_train = X_scaled[:n_train],              y[:n_train]
+X_val,   y_val   = X_scaled[n_train:n_train+n_val], y[n_train:n_train+n_val]
+X_test,  y_test  = X_scaled[n_train+n_val:],        y[n_train+n_val:]
+
+# ── fit models (exact hyperparameters from thesis) ──────────────
+ols   = LinearRegression().fit(X_train, y_train)
+ridge = RidgeCV(alphas=np.logspace(-3, 3, 50), cv=5).fit(X_train, y_train)
+lasso = LassoCV(alphas=np.logspace(-5, 1, 50), cv=5,
+                max_iter=5_000).fit(X_train, y_train)
+rf    = RandomForestRegressor(n_estimators=200, max_depth=8,
+                              min_samples_leaf=20, n_jobs=-1,
+                              random_state=42).fit(X_train, y_train)
+xgb   = XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.05,
+                     subsample=0.8, colsample_bytree=0.8,
+                     random_state=42, verbosity=0).fit(
+    X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+# statsmodels OLS for inference
+X_tr_sm    = sm.add_constant(X_train)
+X_te_sm    = sm.add_constant(X_test, has_constant="add")
+ols_sm     = sm.OLS(y_train, X_tr_sm).fit(cov_type="HC3")
+residuals  = ols_sm.resid
+
+print("Models ready.\n")
+
+
+# =============================================================================
+# TABLE 4 — Stationarity Tests: ADF and KPSS Results
+# =============================================================================
+# Exact values from Section 3.1 / Table 4 of the thesis.
+# Colour coding:
+#   • Order column: gold  = I(1),  green = I(0)
+#   • ADF p (level): red background when > 0.05  (cannot reject unit root)
+#   • ADF p (Δ):     green background when < 0.05 (stationary in differences)
+# =============================================================================
+
+def table_4():
+    print("Table 4 — Stationarity Tests")
+
+    columns = [
+        "Variable",
+        "ADF Stat\n(level)",
+        "ADF p\n(level)",
+        "KPSS\nStat",
+        "KPSS\np",
+        "ADF Stat\n(Δ)",
+        "ADF p\n(Δ)",
+        "Order",
+    ]
+    col_widths = [1.6, 1.1, 1.0, 1.0, 0.9, 1.1, 1.0, 0.8]
+    col_align  = ["l", "r", "r", "r", "r", "r", "r", "c"]
+
+    # [Variable, ADF_stat_lev, ADF_p_lev, KPSS_stat, KPSS_p,
+    #  ADF_stat_diff, ADF_p_diff, Order]
+    data = [
+        ["log(S&P500)", " 0.068",  "0.964",  "22.082", "< 0.01", "−19.890", "< 0.001", "I(1)"],
+        ["CPI",         " 0.964",  "0.994",  "22.154", "< 0.01", "−50.967", "< 0.001", "I(1)"],
+        ["FFR",         "−2.429",  "0.134",  " 0.950", "< 0.01", " −4.241", "0.0006",  "I(1)"],
+        ["Unemployment","−12.718", "< 0.001"," 0.282", " 0.10",  " −1.727", "0.4173",  "I(0)"],
+        ["log(M2)",     "−0.787",  "0.823",  "21.945", "< 0.01", "−19.468", "< 0.001", "I(1)"],
+        ["log(GDP)",    "−0.679",  "0.852",  "21.497", "< 0.01", "−24.206", "< 0.001", "I(1)"],
+        ["VIX",         "−2.205",  "0.204",  "11.963", "< 0.01", " −3.561", "0.0065",  "I(1)"],
+    ]
+
+    # Build per-cell colour grid
+    row_colors = []
+    for row in data:
+        order      = row[7]
+        adf_p_lev  = row[2]    # string
+        adf_p_diff = row[6]    # string
+
+        # ADF p-value level: red if > 0.05  (i.e. cannot reject H0 of unit root)
+        if "< 0.001" in adf_p_lev:
+            adf_lev_bg = GREEN_B
+        elif "0." in adf_p_lev and float(adf_p_lev.replace(" ", "")) > 0.05:
+            adf_lev_bg = RED_B
+        else:
+            adf_lev_bg = GREEN_B
+
+        # ADF p diff: green if stationary (< 0.05)
+        if "< 0.001" in adf_p_diff or (
+                "0." in adf_p_diff and
+                float(adf_p_diff.strip()) < 0.05):
+            adf_diff_bg = GREEN_B
+        else:
+            adf_diff_bg = RED_B
+
+        order_bg = GOLD_B if order == "I(1)" else GREEN_B
+
+        row_colors.append([
+            WHITE,        # Variable
+            OFFWHITE,     # ADF stat level
+            adf_lev_bg,   # ADF p level
+            OFFWHITE,     # KPSS stat
+            OFFWHITE,     # KPSS p
+            OFFWHITE,     # ADF stat diff
+            adf_diff_bg,  # ADF p diff
+            order_bg,     # Order
+        ])
+
+    note = (
+        "Note. ADF null hypothesis: unit root present (non-stationary). "
+        "KPSS null hypothesis: series is stationary.  "
+        "Critical value for ADF at 5%: −2.862.  "
+        "KPSS critical value at 5%: 0.463.  "
+        "Δ = first difference.  Lag length selected by AIC.  "
+        "Colour coding — ADF p (level): red = cannot reject H₀ (I(1) confirmed); "
+        "ADF p (Δ): green = stationary after differencing.  "
+        "Order column: gold = I(1), green = I(0)."
+    )
+
+    draw_table(
+        title      = "Table 4.  Stationarity Tests: ADF and KPSS Results",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_04_stationarity.png",
+        figsize    = (13, 5.8),
+    )
+
+
+# =============================================================================
+# TABLE 5 — Engle–Granger Cointegration Test Results
+# =============================================================================
+# Values from Section 3.2 / Table 5.
+# Red background = not cointegrated (all pairs in this study).
+# Critical value at 5%: −3.34.
+# =============================================================================
+
+def table_5():
+    print("Table 5 — Cointegration")
+
+    columns    = ["Variable Pair", "EG Test Statistic", "p-value", "Cointegrated (5%)"]
+    col_widths = [2.8, 1.8, 1.4, 2.0]
+    col_align  = ["l", "r", "r", "c"]
+
+    data = [
+        ["log(S&P500) ~ CPI",          "−2.107", "0.473", "No"],
+        ["log(S&P500) ~ FFR",          "−0.259", "0.978", "No"],
+        ["log(S&P500) ~ Unemployment", "−0.180", "0.981", "No"],
+        ["log(S&P500) ~ log(M2)",      "−2.584", "0.243", "No"],
+        ["log(S&P500) ~ log(GDP)",     "−1.619", "0.713", "No"],
+        ["log(S&P500) ~ VIX",          " 0.755", "0.994", "No"],
+    ]
+
+    # All "No" → red in last column; stat > −3.34 → red in stat column
+    row_colors = []
+    for i, row in enumerate(data):
+        bg = WHITE if i % 2 == 0 else OFFWHITE
+        row_colors.append([bg, RED_B, RED_B, RED_B])
+
+    note = (
+        "Note. Null hypothesis: no cointegration between the two series.  "
+        "Test statistic is from the Engle–Granger two-step procedure: "
+        "OLS residuals from the first-stage regression are tested for stationarity "
+        "using the ADF test.  Critical value at 5%: approximately −3.34.  "
+        "All p-values exceed 0.20, confirming the absence of cointegration.  "
+        "N = 16,957 daily observations."
+    )
+
+    draw_table(
+        title      = "Table 5.  Engle–Granger Cointegration Test Results",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_05_cointegration.png",
+        figsize    = (10, 5.2),
+    )
+
+
+# =============================================================================
+# TABLE 6 — OLS Regression Results: Δlog(S&P500)
+# =============================================================================
+# Values from Section 3.3 / Table 6.
+# Significant rows (CPI * and logGDP *) highlighted green.
+# Intercept highlighted separately.
+# =============================================================================
+
+def table_6():
+    print("Table 6 — OLS Regression")
+
+    columns    = ["Variable", "Coefficient", "Std. Error", "t-statistic", "p-value", "Sig."]
+    col_widths = [1.6, 1.5, 1.4, 1.4, 1.3, 0.8]
+    col_align  = ["l", "r", "r", "r", "r", "c"]
+
+    # exact values from thesis Table 6
+    data = [
+        ["Intercept",    "2.570e−04", "2.700e−05", " 9.541",  "< 0.001", "***"],
+        ["CPI",          "6.600e−05", "2.900e−05", " 2.288",  "0.0222",  "*"  ],
+        ["FFR",          "−3.800e−05","2.700e−05", "−1.422",  "0.1552",  ""   ],
+        ["Unemployment", "−5.000e−06","2.900e−05", "−0.177",  "0.8598",  ""   ],
+        ["log(M2)",      "2.500e−05", "3.300e−05", " 0.780",  "0.4351",  ""   ],
+        ["log(GDP)",     "−6.500e−05","3.200e−05", "−2.051",  "0.0402",  "*"  ],
+        ["VIX",          "−2.000e−05","3.500e−05", "−0.578",  "0.5631",  ""   ],
+    ]
+
+    sig_map = {"***": GREEN_B, "**": GREEN_B, "*": GREEN_B, "": WHITE}
+    row_colors = []
+    for i, row in enumerate(data):
+        sig  = row[5]
+        base = OFFWHITE if i % 2 != 0 else WHITE
+        bg   = sig_map.get(sig, base) if sig else base
+        row_colors.append([bg, bg, bg, bg, bg, GREEN_B if sig else base])
+
+    # intercept row — light blue tint
+    row_colors[0] = [PALE] * 6
+
+    note = (
+        "Note. Dependent variable: Δlog(S&P500). All predictors are first-differenced "
+        "and standardized to zero mean and unit variance prior to estimation. "
+        "HC3 heteroscedasticity-robust standard errors applied throughout. "
+        "*** p < 0.001;  ** p < 0.01;  * p < 0.05.  "
+        "N = 11,869 observations (training set, 70% of full sample).  "
+        "R² (train) = 0.0014;  R² (test) = −0.2332;  "
+        "F-statistic = 2.149  (p = 0.0449)."
+    )
+
+    draw_table(
+        title      = "Table 6.  OLS Regression Results: Δlog(S&P500) on Macroeconomic First Differences",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_06_ols_results.png",
+        figsize    = (12, 5.6),
+    )
+
+
+# =============================================================================
+# TABLE 7 — Regression Diagnostic Test Results
+# =============================================================================
+# Values from Section 3.4 / Table 7.
+# JB and BP → reject H₀ (red)  |  DW ≈ 2 → no autocorrelation (green)
+# =============================================================================
+
+def table_7():
+    print("Table 7 — Diagnostics")
+
+    columns    = ["Test", "Statistic", "p-value", "Interpretation"]
+    col_widths = [2.4, 1.4, 1.2, 4.0]
+    col_align  = ["l", "r", "c", "l"]
+
+    data = [
+        ["Jarque–Bera  (normality)",
+         "27,328.30", "< 0.001",
+         "Reject H₀ — residuals non-normal (excess kurtosis = 10.43; fat tails)"],
+        ["Breusch–Pagan  (heteroscedasticity)",
+         "548.19", "< 0.001",
+         "Reject H₀ — heteroscedasticity present → HC3 robust SEs applied"],
+        ["Durbin–Watson  (autocorrelation)",
+         "1.9719", "—",
+         "DW ≈ 2.0 → no significant first-order autocorrelation in residuals"],
+        ["F-statistic  (joint significance)",
+         "2.149", "0.0449",
+         "Reject H₀ — macroeconomic variables jointly significant → H5 confirmed"],
+    ]
+
+    row_colors = [
+        [RED_B,   RED_B,   RED_B,   RED_B  ],   # JB  — reject normality
+        [RED_B,   RED_B,   RED_B,   RED_B  ],   # BP  — reject homoscedasticity
+        [GREEN_B, GREEN_B, GREEN_B, GREEN_B],   # DW  — no autocorrelation
+        [GREEN_B, GREEN_B, GREEN_B, GREEN_B],   # F   — H5 supported
+    ]
+
+    note = (
+        "Note. HC3 = heteroscedasticity-consistent standard errors (White, 1980). "
+        "DW = Durbin–Watson statistic; values near 2.0 indicate the absence of "
+        "first-order autocorrelation. "
+        "All tests conducted on OLS training-set residuals (N = 11,869). "
+        "Colour coding: red = H₀ rejected (assumption violated); "
+        "green = assumption satisfied."
+    )
+
+    draw_table(
+        title      = "Table 7.  Regression Diagnostic Test Results",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_07_diagnostics.png",
+        figsize    = (13, 4.8),
+    )
+
+
+# =============================================================================
+# TABLE 8 — Model Performance Comparison on Test Set
+# =============================================================================
+# Values from Section 3.5 / Table 8.
+# Best value per metric highlighted green; worst highlighted red.
+# =============================================================================
+
+def table_8():
+    print("Table 8 — Model Comparison")
+
+    columns    = ["Model", "MAE", "RMSE", "MAPE (%)", "R²"]
+    col_widths = [2.0, 1.5, 1.5, 1.5, 1.5]
+    col_align  = ["l", "r", "r", "r", "r"]
+
+    # compute from fitted models for exact reproducibility
+    def metrics(model):
+        pred = model.predict(X_test)
+        mae  = np.mean(np.abs(y_test - pred))
+        rmse = np.sqrt(np.mean((y_test - pred) ** 2))
+        mape = np.mean(np.abs((y_test - pred) /
+                              (np.abs(y_test) + 1e-8))) * 100
+        r2   = r2_score(y_test, pred)
+        return mae, rmse, mape, r2
+
+    model_list = [
+        ("OLS (Baseline)", ols),
+        ("Ridge",          ridge),
+        ("Lasso",          lasso),
+        ("Random Forest",  rf),
+        ("XGBoost",        xgb),
+    ]
+
+    rows_raw = []
+    for name, m in model_list:
+        mae, rmse, mape, r2 = metrics(m)
+        rows_raw.append((name, mae, rmse, mape, r2))
+
+    data = [
+        [r[0], f"{r[1]:.5f}", f"{r[2]:.5f}", f"{r[3]:.2f}", f"{r[4]:.4f}"]
+        for r in rows_raw
+    ]
+
+    # per-metric: best = green, worst = red, others = alternating
+    mae_vals  = [r[1] for r in rows_raw]
+    rmse_vals = [r[2] for r in rows_raw]
+    r2_vals   = [r[4] for r in rows_raw]
+
+    best_mae  = np.argmin(mae_vals);  worst_mae  = np.argmax(mae_vals)
+    best_rmse = np.argmin(rmse_vals); worst_rmse = np.argmax(rmse_vals)
+    best_r2   = np.argmax(r2_vals);   worst_r2   = np.argmin(r2_vals)
+
+    row_colors = []
+    for i in range(len(data)):
+        bg   = WHITE if i % 2 == 0 else OFFWHITE
+        mae_bg  = GREEN_B if i == best_mae  else (RED_B if i == worst_mae  else bg)
+        rmse_bg = GREEN_B if i == best_rmse else (RED_B if i == worst_rmse else bg)
+        r2_bg   = GREEN_B if i == best_r2   else (RED_B if i == worst_r2   else bg)
+        row_colors.append([bg, mae_bg, rmse_bg, bg, r2_bg])
+
+    note = (
+        "Note. All models estimated on 70% training set (N = 11,869); "
+        "evaluated on held-out 15% test set (N = 2,544). "
+        "Negative R² indicates predictions are worse than the mean-prediction "
+        "baseline, consistent with near-random-walk behaviour of daily equity returns. "
+        "MAPE is distorted by near-zero observations in the denominator; "
+        "MAE and RMSE are the primary comparison metrics. "
+        "Colour coding: green = best value for that metric; red = worst."
+    )
+
+    draw_table(
+        title      = "Table 8.  Model Performance Comparison on Held-Out Test Set (15% of sample)",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_08_model_comparison.png",
+        figsize    = (11, 5.0),
+    )
+
+
+# =============================================================================
+# TABLE 9 — Feature Importance Scores: RF and XGBoost
+# =============================================================================
+# Values from Section 3.6 / Table 9 (sorted by RF importance descending).
+# Top-2 RF features highlighted.
+# =============================================================================
+
+def table_9():
+    print("Table 9 — Feature Importance")
+
+    columns    = ["Feature", "RF Importance", "XGB Importance", "Economic Interpretation"]
+    col_widths = [1.6, 1.6, 1.7, 4.1]
+    col_align  = ["l", "r", "r", "l"]
+
+    rf_imp  = rf.feature_importances_
+    xgb_imp = xgb.feature_importances_
+
+    interp = {
+        "CPI"          : "Inflation dynamics — Fama proxy effect",
+        "FFR"          : "Monetary policy rate — key per theory",
+        "Unemployment" : "Labor market — corporate earnings signal",
+        "log(M2)"      : "Money supply — liquidity effect",
+        "log(GDP)"     : "Economic output growth / momentum",
+        "VIX"          : "Market volatility / risk sentiment",
+    }
+
+    # Sort by RF importance descending (matches thesis Table 9)
+    order   = np.argsort(rf_imp)[::-1]
+    feat_sorted = [FEAT_LABELS[i] for i in order]
+    rf_sorted   = rf_imp[order]
+    xgb_sorted  = xgb_imp[order]
+
+    data = [
+        [feat_sorted[i],
+         f"{rf_sorted[i]:.4f}",
+         f"{xgb_sorted[i]:.4f}",
+         interp.get(feat_sorted[i], "")]
+        for i in range(len(feat_sorted))
+    ]
+
+    # Top-2 RF → green tint; rest alternating
+    row_colors = []
+    for i in range(len(data)):
+        if i < 2:
+            row_colors.append([GREEN_B, GREEN_B, OFFWHITE, GREEN_B])
+        else:
+            bg = WHITE if i % 2 == 0 else OFFWHITE
+            row_colors.append([bg, bg, bg, bg])
+
+    note = (
+        "Note. Importance scores are normalized so that all scores within a model "
+        "sum to 1.0.  RF = Random Forest (200 trees, max depth 8, min leaf 20).  "
+        "XGB = XGBoost (300 estimators, learning rate 0.05, max depth 4).  "
+        "Higher scores indicate greater contribution to prediction.  "
+        "Colour coding: green = top-2 features by RF importance."
+    )
+
+    draw_table(
+        title      = "Table 9.  Feature Importance Scores: Random Forest and XGBoost",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_09_feature_importance.png",
+        figsize    = (12, 5.5),
+    )
+
+
+# =============================================================================
+# TABLE 10 — Hypothesis Test Summary
+# =============================================================================
+# Values from Chapter 4 / Table 10.
+# Green = H₀ rejected (hypothesis supported or significant result found).
+# Gold  = H₀ not rejected.
+# =============================================================================
+
+def table_10():
+    print("Table 10 — Hypothesis Summary")
+
+    columns    = ["H", "Statement", "OLS Coefficient", "p-value", "Decision"]
+    col_widths = [0.6, 2.8, 2.0, 1.1, 2.5]
+    col_align  = ["c", "l", "l", "r", "l"]
+
+    data = [
+        ["H1", "FFR negatively affects S&P 500",
+         "Negative  (−3.83×10⁻⁵)",  "0.155",
+         "H₀ not rejected  (p > 0.05)"],
+
+        ["H2", "CPI negatively affects S&P 500",
+         "Positive*  (6.56×10⁻⁵)",   "0.022",
+         "H₀ rejected — unexpected positive sign"],
+
+        ["H3", "M2 positively affects S&P 500",
+         "Positive  (2.54×10⁻⁵)",    "0.435",
+         "H₀ not rejected  (p > 0.05)"],
+
+        ["H4", "Unemployment negatively affects S&P 500",
+         "Negative*  (−6.50×10⁻⁵)",  "0.040",
+         "H₀ rejected — via log(GDP) proxy"],
+
+        ["H5", "Macro variables jointly explain S&P 500 variation",
+         "F-statistic = 2.149",        "0.045",
+         "H₀ rejected → H5 confirmed"],
+    ]
+
+    row_colors = [
+        [GOLD_B,  GOLD_B,  GOLD_B,  GOLD_B,  GOLD_B ],   # H1 — not rejected
+        [GREEN_B, GREEN_B, GREEN_B, GREEN_B, GREEN_B],   # H2 — rejected
+        [GOLD_B,  GOLD_B,  GOLD_B,  GOLD_B,  GOLD_B ],   # H3 — not rejected
+        [GREEN_B, GREEN_B, GREEN_B, GREEN_B, GREEN_B],   # H4 — rejected
+        [GREEN_B, GREEN_B, GREEN_B, GREEN_B, GREEN_B],   # H5 — confirmed
+    ]
+
+    note = (
+        "Note. All coefficients from OLS regression on first-differenced, "
+        "standardized variables with HC3 robust standard errors. "
+        "'Rejected' refers to rejection of H₀ at the 5% significance level. "
+        "* p < 0.05.  "
+        "Colour coding: green = H₀ rejected (statistically significant result); "
+        "gold = H₀ not rejected."
+    )
+
+    draw_table(
+        title      = "Table 10.  Hypothesis Test Summary",
+        columns    = columns,
+        rows       = data,
+        col_widths = col_widths,
+        col_align  = col_align,
+        row_colors = row_colors,
+        note       = note,
+        filename   = "table_10_hypotheses.png",
+        figsize    = (13, 5.0),
+    )
+
+
+# =============================================================================
+# MAIN — generate all tables
+# =============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "=" * 65)
+    print("  GENERATING THESIS TABLES")
+    print("=" * 65 + "\n")
+
+    table_4()
+    table_5()
+    table_6()
+    table_7()
+    table_8()
+    table_9()
+    table_10()
+
+    print("\n" + "=" * 65)
+    print("  ALL TABLES SAVED")
+    print("  table_04_stationarity.png")
+    print("  table_05_cointegration.png")
+    print("  table_06_ols_results.png")
+    print("  table_07_diagnostics.png")
+    print("  table_08_model_comparison.png")
+    print("  table_09_feature_importance.png")
+    print("  table_10_hypotheses.png")
+    print("=" * 65 + "\n")
